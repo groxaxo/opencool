@@ -1,0 +1,294 @@
+function outputContract(task, run) {
+  const acceptance = run.acceptance.map((criterion) => `    { "criterion": ${JSON.stringify(criterion)}, "evidence": "..." }`)
+  return [
+    "Return one final report and no conversational filler, using this exact envelope.",
+    "files_changed must list the exact net repository paths changed during this packet:",
+    "<worker_report>",
+    "{",
+    '  "status": "complete | blocked | failed",',
+    '  "summary": "concise evidence-backed outcome",',
+    '  "confidence": 0.0,',
+    '  "files_changed": [],',
+    '  "tests": [{ "command": "...", "status": "pass | fail | skipped | not_run", "summary": "..." }],',
+    '  "risks": [{ "severity": "low | medium | high | critical", "description": "...", "resolved": false }],',
+    '  "blockers": [],',
+    '  "evidence": [],',
+    '  "acceptance_evidence": [',
+    ...acceptance.map((line, index) => `${line}${index === acceptance.length - 1 ? "" : ","}`),
+    "  ],",
+    `  "verdict": "${task.role === "critic" ? "pass | revise | fail" : "not_applicable"}"`,
+    "}",
+    "</worker_report>",
+  ].join("\n")
+}
+
+function preparePacket(task, guards) {
+  task.packet = {
+    id: crypto.randomUUID(),
+    issued_at: new Date().toISOString(),
+    expected_attempt: task.attempts.length + 1,
+    workspace_guard: guards.workspace,
+    repository_guard: guards.repository,
+  }
+  return task.packet
+}
+
+async function currentGuards() {
+  const [workspace, repository] = await Promise.all([workspaceSnapshot(), repositoryControlSnapshot()])
+  if (!workspace.available) throw new InputError(`cannot continue without a Git workspace snapshot: ${workspace.reason}`)
+  if (!repository.available) throw new InputError(`cannot continue without a Git control snapshot: ${repository.reason}`)
+  return { workspace, repository }
+}
+
+function verifyRunContinuity(run, guards) {
+  const expected = run.current_guard
+  if (!expected) return
+  if (expected.workspace?.digest !== guards.workspace.digest) {
+    throw new InputError(
+      "tracked or unignored repository state changed outside a recorded orchestration packet; restore it or start a new run",
+    )
+  }
+  if (expected.repository?.digest !== guards.repository.digest) {
+    throw new InputError(
+      "protected Git control state changed outside a recorded orchestration packet; restore it or start a new run",
+    )
+  }
+}
+
+async function preparePackets(tasks, suppliedGuards) {
+  const guards = suppliedGuards ?? (await currentGuards())
+  for (const task of tasks) preparePacket(task, guards)
+  return guards
+}
+
+function makePacket(run, task, feedback) {
+  if (!task.packet) throw new InputError(`task ${task.id} has no issued packet`)
+  const dependencies = dependencyContext(run, task)
+  const allowed = task.scope.length ? task.scope.map((item) => `- ${item}`).join("\n") : "- Read-only repository access"
+  const deliverables = task.deliverables.length
+    ? task.deliverables.map((item) => `- ${item}`).join("\n")
+    : "- Complete the bounded objective and report evidence"
+  const validation = task.validation.length
+    ? task.validation.map((item) => `- ${item}`).join("\n")
+    : "- Follow repository-local validation guidance; do not use GitHub Actions"
+  const dependencyText = dependencies.length
+    ? JSON.stringify(dependencies, null, 2)
+    : "No prior worker results; perform this task independently."
+
+  const prompt = [
+    `You are ${task.agent}, a bounded subordinate coding agent in orchestration run ${run.id}.`,
+    "",
+    "## Parent objective",
+    run.objective,
+    "",
+    "## Your assignment",
+    task.objective,
+    "",
+    "## Packet identity",
+    task.packet.id,
+    "",
+    "## Role rules",
+    ...ROLE_RULES[task.role].map((rule) => `- ${rule}`),
+    "- Do not delegate to another agent.",
+    "- Do not ask the user questions. If blocked, report the blocker with evidence.",
+    "- Never use GitHub Actions; execute relevant validation locally.",
+    "",
+    `## Mutation policy\n${task.mutates ? "You may edit only the declared scope." : "You are strictly read-only."}`,
+    allowed,
+    "",
+    "## Parent constraints",
+    ...(run.constraints.length ? run.constraints.map((item) => `- ${item}`) : ["- Preserve repository conventions and unrelated behavior."]),
+    "",
+    "## Deliverables",
+    deliverables,
+    "",
+    "## Validation",
+    validation,
+    "",
+    "## Acceptance criteria",
+    ...run.acceptance.map((item) => `- ${item}`),
+    "",
+    "## Dependency results",
+    dependencyText,
+    ...(feedback ? ["", "## Parent feedback for this attempt", feedback] : []),
+    "",
+    outputContract(task, run),
+  ].join("\n")
+
+  return {
+    run_id: run.id,
+    task_id: task.id,
+    packet_id: task.packet.id,
+    description: task.objective.slice(0, 80),
+    subagent_type: task.agent,
+    mutates: task.mutates,
+    scope: task.scope,
+    depends_on: task.depends_on,
+    workspace_guard: publicSnapshot(task.packet.workspace_guard),
+    repository_guard: publicSnapshot(task.packet.repository_guard),
+    ...(task.mutates ? {} : { readonly_guard: publicSnapshot(task.packet.workspace_guard) }),
+    prompt,
+  }
+}
+
+function publicTask(task) {
+  return {
+    id: task.id,
+    role: task.role,
+    agent: task.agent,
+    objective: task.objective,
+    scope: task.scope,
+    mutates: task.mutates,
+    depends_on: task.depends_on,
+    state: task.state,
+    attempt_count: task.attempts.length,
+    packet_issued: Boolean(task.packet),
+    invalidated_by: task.invalidated_by,
+    latest: summarizeAttempt(task),
+  }
+}
+
+function refreshIndex(run) {
+  run.tasksByID = Object.fromEntries(run.tasks.map((task) => [task.id, task]))
+  return run
+}
+
+async function orchestratorPlan(raw) {
+  const input = requireObject(raw, "arguments")
+  const objective = requiredString(input.objective, "objective", 8)
+  const complexity = enumValue(input.complexity, "complexity", COMPLEXITIES)
+  const changesCode = requiredBoolean(input.changes_code, "changes_code")
+  const constraints = stringArray(input.constraints, "constraints", { optional: true })
+  const acceptance = stringArray(input.acceptance, "acceptance", { min: 1 })
+  if (!Array.isArray(input.workstreams) || input.workstreams.length < 1 || input.workstreams.length > 12) {
+    throw new InputError("workstreams must contain between 1 and 12 tasks")
+  }
+  const tasks = input.workstreams.map((item, index) => normalizeWorkstream(item, index, changesCode))
+  const ids = new Set()
+  for (const task of tasks) {
+    if (ids.has(task.id)) throw new InputError(`duplicate task id: ${task.id}`)
+    ids.add(task.id)
+  }
+
+  roleRequirements(complexity, changesCode, tasks)
+  wireRoleDependencies(tasks)
+  validateDependencies(tasks)
+  validateParallelMutation(tasks)
+  const waves = executionWaves(tasks)
+  const id = makeRunID()
+  const now = new Date().toISOString()
+  const run = refreshIndex({
+    version: STATE_VERSION,
+    id,
+    status: "open",
+    created_at: now,
+    updated_at: now,
+    objective,
+    complexity,
+    changes_code: changesCode,
+    constraints,
+    acceptance,
+    policy: {
+      min_confidence: MIN_CONFIDENCE[complexity],
+      requires_tests: changesCode,
+      requires_critic: ["medium", "high", "critical"].includes(complexity),
+      requires_explorer: ["high", "critical"].includes(complexity),
+      execution_plane: "OpenCode native task tool",
+      decision_owner: "primary architect model",
+      worker_model: "qwen-local/qwen3.8-27b",
+      mutation_order: "serialized",
+      scope_enforcement: "verified-workspace-delta",
+      git_control_enforcement: "head-branch-index-refs-stash-remotes-worktrees-local-config",
+    },
+    waves,
+    tasks,
+    close: undefined,
+  })
+  const ready = readyTasks(run)
+  const initialGuards = await preparePackets(ready)
+  run.current_guard = {
+    workspace: publicSnapshot(initialGuards.workspace),
+    repository: publicSnapshot(initialGuards.repository),
+  }
+  await saveRun(run)
+
+  const warnings = []
+  if (tasks.length >= 4 && !tasks.some((task) => task.role === "synthesizer")) {
+    warnings.push("Consider a qwen-synthesizer before the critic when worker output is large; it is optional, not a gate requirement.")
+  }
+  return {
+    run_id: id,
+    objective,
+    policy: run.policy,
+    execution_waves: waves,
+    warnings,
+    ready_tasks: ready.map((task) => makePacket(run, task)),
+    next_action:
+      "Invoke OpenCode's native task tool once per ready task, using the returned subagent_type, description, and prompt. Only independent read-only packets may run in parallel; mutating workers are dependency-serialized. Then call hierarchy_orchestrator_record for each result.",
+  }
+}
+
+function validatePacketConcurrency(run, task) {
+  const active = run.tasks.filter((candidate) => candidate.id !== task.id && candidate.packet)
+  if (task.mutates && active.length > 0) {
+    throw new InputError(
+      `mutating task ${task.id} cannot start while other packets are active`,
+      active.map((candidate) => candidate.id),
+    )
+  }
+  const activeWriter = active.find((candidate) => candidate.mutates)
+  if (activeWriter) {
+    throw new InputError(
+      `task ${task.id} cannot start while mutating task ${activeWriter.id} has an active packet`,
+    )
+  }
+}
+
+async function orchestratorPacket(raw) {
+  const input = requireObject(raw, "arguments")
+  const run = refreshIndex(await loadRun(requiredString(input.run_id, "run_id")))
+  if (run.status !== "open") throw new InputError(`run ${run.id} is ${run.status}`)
+  const taskID = requiredString(input.task_id, "task_id")
+  const task = run.tasksByID[taskID]
+  if (!task) throw new InputError(`unknown task_id ${taskID} in run ${run.id}`)
+  const blockedBy = task.depends_on.filter((dependency) => run.tasksByID[dependency].state !== "complete")
+  if (blockedBy.length) {
+    throw new InputError(`task ${taskID} is blocked by incomplete dependencies`, blockedBy)
+  }
+  const replaceActive = optionalBoolean(input.replace_active, "replace_active", false)
+  if (task.packet && !replaceActive) {
+    throw new InputError(
+      `task ${taskID} already has an active packet; record it or set replace_active to rotate it intentionally`,
+    )
+  }
+  validatePacketConcurrency(run, task)
+  const feedback = optionalString(input.feedback, "feedback")
+  const guards = await currentGuards()
+  verifyRunContinuity(run, guards)
+  await preparePackets([task], guards)
+  run.gate = undefined
+  await saveRun(run)
+  return {
+    packet: makePacket(run, task, feedback),
+    blocked_by: [],
+    resume_task_session_id: task.attempts.at(-1)?.task_session_id,
+    next_action:
+      task.attempts.length > 0
+        ? "Resume the prior native task session when possible, supply this packet as targeted feedback, then record the new attempt."
+        : "Launch this packet with OpenCode's native task tool and record the result.",
+  }
+}
+
+function normalizeTests(value) {
+  if (value === undefined) return []
+  if (!Array.isArray(value)) throw new InputError("report.tests must be an array")
+  return value.map((entry, index) => {
+    const item = requireObject(entry, `report.tests[${index}]`)
+    return {
+      command: requiredString(item.command, `report.tests[${index}].command`),
+      status: enumValue(item.status, `report.tests[${index}].status`, TEST_STATUSES),
+      summary: optionalString(item.summary, `report.tests[${index}].summary`) || "",
+    }
+  })
+}
+

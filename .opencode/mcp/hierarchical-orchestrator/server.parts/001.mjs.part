@@ -1,0 +1,327 @@
+function runPath(runID, archived = false) {
+  if (!RUN_ID.test(runID)) throw new InputError(`invalid run_id: ${runID}`)
+  return path.join(archived ? archiveDir : stateDir, `${runID}.json`)
+}
+
+async function ensureStateDirs() {
+  await mkdir(stateDir, { recursive: true, mode: 0o700 })
+  await mkdir(archiveDir, { recursive: true, mode: 0o700 })
+  if (process.platform !== "win32") {
+    await Promise.all([chmod(stateDir, 0o700), chmod(archiveDir, 0o700)]).catch(() => {})
+  }
+}
+
+function workspaceExclusions() {
+  const relative = path.relative(workspaceRoot, stateDir).replaceAll("\\", "/")
+  if (!relative || relative === "." || relative.startsWith("../") || path.posix.isAbsolute(relative)) return []
+  return [`:(exclude)${relative}`, `:(exclude)${relative}/**`]
+}
+
+function gitResult(args) {
+  return new Promise((resolve, reject) => {
+    const child = spawn("git", args, { cwd: workspaceRoot, stdio: ["ignore", "pipe", "pipe"] })
+    const stdout = []
+    let stderr = ""
+    let settled = false
+    child.stdout.on("data", (chunk) => stdout.push(chunk))
+    child.stderr.setEncoding("utf8")
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk
+    })
+    child.once("error", (error) => {
+      if (settled) return
+      settled = true
+      reject(error)
+    })
+    child.once("close", (code) => {
+      if (settled) return
+      settled = true
+      resolve({ code: code ?? -1, stdout: Buffer.concat(stdout), stderr: stderr.trim() })
+    })
+  })
+}
+
+async function gitBuffer(args, options = {}) {
+  const result = await gitResult(args)
+  if (result.code === 0) return result.stdout
+  if (options.optional) return undefined
+  throw new Error(result.stderr || `git ${args[0]} exited with ${result.code}`)
+}
+
+function normalizeGitPath(value) {
+  const normalized = value.replaceAll("\\", "/").replace(/^\.\//, "").replace(/\/+$/, "")
+  if (!normalized || path.posix.isAbsolute(normalized) || normalized.split("/").includes("..")) {
+    throw new Error(`git returned an unsafe repository path: ${JSON.stringify(value)}`)
+  }
+  return normalized
+}
+
+function zeroTerminatedPaths(buffer) {
+  if (!buffer?.length) return []
+  return buffer
+    .toString("utf8")
+    .split("\0")
+    .filter(Boolean)
+    .map(normalizeGitPath)
+}
+
+async function digestFilesystemEntry(file) {
+  const absolute = path.resolve(workspaceRoot, file)
+  const relative = path.relative(workspaceRoot, absolute).replaceAll("\\", "/")
+  if (!relative || relative.startsWith("../") || path.posix.isAbsolute(relative)) {
+    throw new Error(`workspace path escaped the repository: ${file}`)
+  }
+
+  const info = await lstat(absolute)
+  const hash = crypto.createHash("sha256")
+  hash.update(`mode:${info.mode}\0size:${info.size}\0`)
+  if (info.isSymbolicLink()) {
+    hash.update("symlink\0")
+    hash.update(await readlink(absolute))
+    return hash.digest("hex")
+  }
+  if (!info.isFile()) {
+    hash.update(`special:${info.isDirectory() ? "directory" : "other"}`)
+    return hash.digest("hex")
+  }
+
+  hash.update("file\0")
+  await new Promise((resolve, reject) => {
+    const stream = createReadStream(absolute)
+    stream.on("data", (chunk) => hash.update(chunk))
+    stream.once("error", reject)
+    stream.once("end", resolve)
+  })
+  return hash.digest("hex")
+}
+
+function digestParts(parts) {
+  const hash = crypto.createHash("sha256")
+  for (const [label, value] of parts) {
+    hash.update(`\0${label}\0`)
+    hash.update(value)
+  }
+  return hash.digest("hex")
+}
+
+async function workspaceSnapshot() {
+  try {
+    const root = path.resolve((await gitBuffer(["rev-parse", "--show-toplevel"])).toString("utf8").trim())
+    if (root !== workspaceRoot) throw new Error(`workspace root changed from ${workspaceRoot} to ${root}`)
+    const headBuffer = await gitBuffer(["rev-parse", "--verify", "HEAD"], { optional: true })
+    const head = headBuffer?.toString("utf8").trim() || "UNBORN"
+    const exclusions = workspaceExclusions()
+    const unstagedNames = zeroTerminatedPaths(
+      await gitBuffer(["diff", "--no-ext-diff", "--no-renames", "--name-only", "-z", "--", ".", ...exclusions]),
+    )
+    const stagedNames = zeroTerminatedPaths(
+      await gitBuffer([
+        "diff",
+        "--cached",
+        "--no-ext-diff",
+        "--no-renames",
+        "--name-only",
+        "-z",
+        "--",
+        ".",
+        ...exclusions,
+      ]),
+    )
+    const untrackedNames = zeroTerminatedPaths(
+      await gitBuffer(["ls-files", "--others", "--exclude-standard", "-z", "--", ".", ...exclusions]),
+    )
+    const tracked = new Set([...unstagedNames, ...stagedNames])
+    const untracked = new Set(untrackedNames)
+    const entries = {}
+
+    for (const file of [...new Set([...tracked, ...untracked])].sort()) {
+      if (tracked.has(file)) {
+        const [unstaged, staged] = await Promise.all([
+          gitBuffer(["diff", "--no-ext-diff", "--no-renames", "--binary", "--", `:(literal)${file}`]),
+          gitBuffer(["diff", "--cached", "--no-ext-diff", "--no-renames", "--binary", "--", `:(literal)${file}`]),
+        ])
+        entries[file] = {
+          kind: "tracked",
+          digest: digestParts([
+            ["unstaged", unstaged],
+            ["staged", staged],
+          ]),
+        }
+        continue
+      }
+      entries[file] = { kind: "untracked", digest: await digestFilesystemEntry(file) }
+    }
+
+    return {
+      available: true,
+      algorithm: "sha256",
+      root,
+      head,
+      digest: digestParts([["workspace", Buffer.from(JSON.stringify({ root, head, entries }))]]),
+      entries,
+    }
+  } catch (error) {
+    return { available: false, reason: error instanceof Error ? error.message : String(error) }
+  }
+}
+
+async function repositoryControlSnapshot() {
+  try {
+    const root = path.resolve((await gitBuffer(["rev-parse", "--show-toplevel"])).toString("utf8").trim())
+    if (root !== workspaceRoot) throw new Error(`workspace root changed from ${workspaceRoot} to ${root}`)
+    const commands = [
+      ["head", ["rev-parse", "--verify", "HEAD"], true],
+      ["branch", ["symbolic-ref", "--quiet", "HEAD"], true],
+      ["index", ["ls-files", "--stage", "-z"], false],
+      ["refs", ["for-each-ref", "--format=%(refname)%00%(objectname)", "refs/heads", "refs/tags"], false],
+      ["stash", ["stash", "list", "--format=%H"], false],
+      ["remotes", ["remote", "-v"], false],
+      ["worktrees", ["worktree", "list", "--porcelain"], false],
+      ["config", ["config", "--local", "--null", "--list"], false],
+    ]
+    const parts = [["root", Buffer.from(root)]]
+    const fields = { root }
+    for (const [label, args, optional] of commands) {
+      const output = await gitBuffer(args, { optional })
+      const value = output ?? Buffer.from("UNAVAILABLE")
+      parts.push([label, value])
+      if (label === "head" || label === "branch") fields[label] = value.toString("utf8").trim() || "UNBORN"
+    }
+    return { available: true, algorithm: "sha256", ...fields, digest: digestParts(parts) }
+  } catch (error) {
+    return { available: false, reason: error instanceof Error ? error.message : String(error) }
+  }
+}
+
+function publicSnapshot(snapshot) {
+  if (!snapshot?.available) return { available: false, reason: snapshot?.reason || "snapshot unavailable" }
+  return {
+    available: true,
+    algorithm: snapshot.algorithm,
+    root: snapshot.root,
+    head: snapshot.head,
+    branch: snapshot.branch,
+    digest: snapshot.digest,
+    ...(snapshot.entries ? { dirty_files: Object.keys(snapshot.entries).length } : {}),
+  }
+}
+
+function workspaceDelta(before, after) {
+  if (!before?.available || !after?.available) return { available: false, paths: [], head_changed: false }
+  const paths = [...new Set([...Object.keys(before.entries || {}), ...Object.keys(after.entries || {})])]
+    .filter((file) => {
+      const left = before.entries?.[file]
+      const right = after.entries?.[file]
+      return left?.kind !== right?.kind || left?.digest !== right?.digest
+    })
+    .sort()
+  return {
+    available: true,
+    paths,
+    head_changed: before.head !== after.head || before.root !== after.root,
+  }
+}
+
+async function withRunLock(runID, action) {
+  await ensureStateDirs()
+  const lock = path.join(stateDir, `${runID}.lock`)
+  for (let attempt = 0; attempt < 250; attempt += 1) {
+    try {
+      await mkdir(lock, { mode: 0o700 })
+    } catch (error) {
+      if (error?.code !== "EEXIST") throw error
+      const info = await lstat(lock).catch(() => undefined)
+      if (info && Date.now() - info.mtimeMs > 30_000) {
+        await rm(lock, { recursive: true, force: true })
+        continue
+      }
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      continue
+    }
+
+    try {
+      return await action()
+    } finally {
+      await rm(lock, { recursive: true, force: true })
+    }
+  }
+  throw new InputError(`timed out waiting for orchestration state lock for ${runID}`)
+}
+
+async function saveRun(run) {
+  return withRunLock(run.id, async () => {
+    const target = runPath(run.id)
+    if (run._loaded_updated_at !== undefined) {
+      let current
+      try {
+        current = JSON.parse(await readFile(target, "utf8"))
+      } catch (error) {
+        if (error?.code === "ENOENT") throw new InputError(`run state disappeared before update: ${run.id}`)
+        throw error
+      }
+      if (current.updated_at !== run._loaded_updated_at) {
+        throw new InputError(`run ${run.id} changed in another OpenCode process; reload status before retrying`)
+      }
+    }
+
+    const updatedAt = new Date().toISOString()
+    const temporary = `${target}.${process.pid}.${Date.now()}.tmp`
+    const { tasksByID: _derivedIndex, _loaded_updated_at: _loadedVersion, ...persisted } = {
+      ...run,
+      updated_at: updatedAt,
+    }
+    await writeFile(temporary, `${JSON.stringify(persisted, null, 2)}\n`, { encoding: "utf8", mode: 0o600 })
+    await rename(temporary, target)
+    run.updated_at = updatedAt
+    run._loaded_updated_at = updatedAt
+  })
+}
+
+function migrateRunState(run) {
+  if (run.version === STATE_VERSION) return run
+  if (run.version !== 1) throw new InputError(`unsupported state version for ${run.id || "unknown run"}`)
+
+  const migratedAt = new Date().toISOString()
+  run.version = STATE_VERSION
+  run.gate = undefined
+  run.current_guard = undefined
+  run.migration = {
+    from_version: 1,
+    migrated_at: migratedAt,
+    action: "All legacy evidence was invalidated and must be rerun under verified workspace and Git-control guards.",
+  }
+  run.policy = {
+    ...run.policy,
+    mutation_order: "serialized",
+    scope_enforcement: "verified-workspace-delta",
+    git_control_enforcement: "head-branch-index-refs-stash-remotes-worktrees-local-config",
+  }
+  for (const task of run.tasks || []) {
+    task.packet = undefined
+    const latest = task.attempts?.at(-1)
+    if (!latest) continue
+    latest.invalidated_at = migratedAt
+    latest.invalidated_by = { task_id: "state-migration", attempt: 0 }
+    task.state = "pending"
+    task.invalidated_by = {
+      task_id: "state-migration",
+      attempt: 0,
+      invalidated_at: migratedAt,
+    }
+  }
+  return run
+}
+
+async function loadRun(runID) {
+  const target = runPath(runID)
+  try {
+    const run = migrateRunState(JSON.parse(await readFile(target, "utf8")))
+    run._loaded_updated_at = run.updated_at
+    return run
+  } catch (error) {
+    if (error?.code === "ENOENT") throw new InputError(`run not found: ${runID}`)
+    if (error instanceof SyntaxError) throw new InputError(`run state is corrupt: ${runID}`)
+    throw error
+  }
+}
+

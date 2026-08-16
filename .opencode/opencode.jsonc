@@ -1,6 +1,36 @@
 {
   "$schema": "https://opencode.ai/config.json",
-  "provider": {},
+  "provider": {
+    "qwen-local": {
+      "name": "Qwen Local",
+      "npm": "@ai-sdk/openai-compatible",
+      "options": {
+        "baseURL": "http://127.0.0.1:12434/v1",
+        "apiKey": "local",
+        "timeout": false,
+        "chunkTimeout": 120000,
+      },
+      "models": {
+        "qwen3.8-27b": {
+          "name": "Qwen3.8 27B — Local Worker",
+          "reasoning": true,
+          "temperature": true,
+          "tool_call": true,
+          "interleaved": "reasoning_content",
+          "limit": {
+            "context": 262144,
+            "output": 32768,
+          },
+          "modalities": {
+            "input": ["text"],
+            "output": ["text"],
+          },
+        },
+      },
+    },
+  },
+  "default_agent": "architect",
+  "subagent_depth": 1,
   "permission": {},
   "references": {
     "effect": {
@@ -12,7 +42,33 @@
       "description": "Contains opencode logs and data",
     },
   },
-  "mcp": {},
+  "mcp": {
+    "hierarchy": {
+      "type": "local",
+      "command": [
+        "node",
+        "--input-type=module",
+        "-e",
+        "import { execFileSync } from 'node:child_process'; import path from 'node:path'; import { pathToFileURL } from 'node:url'; const root = execFileSync('git', ['rev-parse', '--show-toplevel'], { encoding: 'utf8' }).trim(); process.chdir(root); await import(pathToFileURL(path.join(root, '.opencode', 'mcp', 'hierarchical-orchestrator', 'server.mjs')).href);"
+      ],
+      "cwd": ".",
+      "environment": {
+        "OPENCODE_ORCHESTRATOR_STATE_DIR": ".opencode/orchestration/state",
+      },
+      "enabled": true,
+      "timeout": 15000,
+    },
+  },
+  "experimental": {
+    "primary_tools": [
+      "hierarchy_orchestrator_plan",
+      "hierarchy_orchestrator_packet",
+      "hierarchy_orchestrator_record",
+      "hierarchy_orchestrator_status",
+      "hierarchy_orchestrator_gate",
+      "hierarchy_orchestrator_close",
+    ],
+  },
   "tools": {
     "github-triage": false,
     "github-pr-search": false,

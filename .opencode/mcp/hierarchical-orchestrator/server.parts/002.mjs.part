@@ -1,0 +1,246 @@
+function normalizeScopeItem(item, label) {
+  const normalized = requiredString(item, label).replaceAll("\\", "/").replace(/^\.\//, "").replace(/\/+$/, "")
+  if (!normalized || normalized === ".") throw new InputError(`${label} cannot resolve to the repository root`)
+  if (normalized.startsWith("!") || /[{}\[\]]/.test(normalized) || [...normalized].some((char) => char.charCodeAt(0) < 32)) {
+    throw new InputError(`${label} may use only literal paths plus '*', '**', and '?' globs: ${item}`)
+  }
+  if (path.posix.isAbsolute(normalized) || /^[a-zA-Z]:\//.test(normalized) || normalized.split("/").includes("..")) {
+    throw new InputError(`${label} must be repository-relative and cannot contain '..': ${item}`)
+  }
+  if (normalized === ".git" || normalized.startsWith(".git/")) {
+    throw new InputError(`${label} cannot reference .git: ${item}`)
+  }
+  return normalized
+}
+
+function validateMutationScope(scope, label) {
+  const prefix = staticPrefix(scope)
+  if (!prefix || scope === "*" || scope === "**" || scope === "**/*") {
+    throw new InputError(`${label} is too broad; declare a concrete top-level path or exact file`)
+  }
+  if ([".git", ".git/config", ".git/refs/heads/main"].some((probe) => globToRegExp(scope).test(probe))) {
+    throw new InputError(`${label} could match Git control data and is not allowed: ${scope}`)
+  }
+}
+
+function normalizeWorkstream(value, index, changesCode) {
+  const input = requireObject(value, `workstreams[${index}]`)
+  const id = requiredString(input.id, `workstreams[${index}].id`)
+  if (!TASK_ID.test(id)) throw new InputError(`workstreams[${index}].id is invalid: ${id}`)
+  const role = enumValue(input.role, `workstreams[${index}].role`, ROLES)
+  const objective = requiredString(input.objective, `workstreams[${index}].objective`, 8)
+  const defaultMutates = role === "worker" && changesCode
+  const mutates = optionalBoolean(input.mutates, `workstreams[${index}].mutates`, defaultMutates)
+  if (mutates && role !== "worker") {
+    throw new InputError(`only worker tasks may mutate files; ${id} has role ${role}`)
+  }
+  const scope = stringArray(input.scope, `workstreams[${index}].scope`, { optional: true }).map((item, scopeIndex) =>
+    normalizeScopeItem(item, `workstreams[${index}].scope[${scopeIndex}]`),
+  )
+  if (mutates && scope.length === 0) throw new InputError(`mutating task ${id} must declare a bounded scope`)
+  if (mutates) scope.forEach((item, scopeIndex) => validateMutationScope(item, `workstreams[${index}].scope[${scopeIndex}]`))
+  return {
+    id,
+    role,
+    agent: ROLE_AGENT[role],
+    objective,
+    scope,
+    deliverables: stringArray(input.deliverables, `workstreams[${index}].deliverables`, { optional: true }),
+    validation: stringArray(input.validation, `workstreams[${index}].validation`, { optional: true }),
+    depends_on: stringArray(input.depends_on, `workstreams[${index}].depends_on`, { optional: true }),
+    mutates,
+    state: "pending",
+    attempts: [],
+  }
+}
+
+function addDependency(task, dependency) {
+  if (task.id === dependency) return
+  if (!task.depends_on.includes(dependency)) task.depends_on.push(dependency)
+}
+
+function wireRoleDependencies(tasks) {
+  const explorers = tasks.filter((task) => task.role === "explorer").map((task) => task.id)
+  const workers = tasks.filter((task) => task.role === "worker").map((task) => task.id)
+  const executionTasks = tasks.filter((task) => !["critic", "synthesizer"].includes(task.role)).map((task) => task.id)
+  const synthesizers = tasks.filter((task) => task.role === "synthesizer").map((task) => task.id)
+
+  for (let index = 1; index < workers.length; index += 1) addDependency(tasks.find((task) => task.id === workers[index]), workers[index - 1])
+
+  for (const task of tasks) {
+    if (task.role === "worker") for (const explorer of explorers) addDependency(task, explorer)
+    if (task.role === "tester") for (const worker of workers) addDependency(task, worker)
+    if (task.role === "synthesizer") for (const dependency of executionTasks) addDependency(task, dependency)
+    if (task.role === "critic") {
+      for (const dependency of [...executionTasks, ...synthesizers]) addDependency(task, dependency)
+    }
+    task.depends_on.sort()
+  }
+}
+
+function validateDependencies(tasks) {
+  const ids = new Set(tasks.map((task) => task.id))
+  for (const task of tasks) {
+    for (const dependency of task.depends_on) {
+      if (!ids.has(dependency)) throw new InputError(`task ${task.id} depends on unknown task ${dependency}`)
+      if (dependency === task.id) throw new InputError(`task ${task.id} cannot depend on itself`)
+    }
+  }
+
+  const visiting = new Set()
+  const visited = new Set()
+  function visit(id) {
+    if (visiting.has(id)) throw new InputError(`task dependency graph contains a cycle at ${id}`)
+    if (visited.has(id)) return
+    visiting.add(id)
+    const task = tasks.find((candidate) => candidate.id === id)
+    for (const dependency of task.depends_on) visit(dependency)
+    visiting.delete(id)
+    visited.add(id)
+  }
+  for (const task of tasks) visit(task.id)
+}
+
+function staticPrefix(scope) {
+  const wildcard = scope.search(/[?*[]/)
+  return (wildcard === -1 ? scope : scope.slice(0, wildcard)).replace(/\/+$/, "")
+}
+
+function scopesOverlap(left, right) {
+  if (left === "*" || left === "**" || right === "*" || right === "**") return true
+  const a = staticPrefix(left)
+  const b = staticPrefix(right)
+  if (!a || !b) return true
+  return a === b || a.startsWith(`${b}/`) || b.startsWith(`${a}/`)
+}
+
+function taskDependsOn(tasksByID, taskID, possibleAncestor, seen = new Set()) {
+  if (seen.has(taskID)) return false
+  seen.add(taskID)
+  const task = tasksByID.get(taskID)
+  if (!task) return false
+  if (task.depends_on.includes(possibleAncestor)) return true
+  return task.depends_on.some((dependency) => taskDependsOn(tasksByID, dependency, possibleAncestor, seen))
+}
+
+function validateParallelMutation(tasks) {
+  const byID = new Map(tasks.map((task) => [task.id, task]))
+  const writers = tasks.filter((task) => task.mutates)
+  for (let leftIndex = 0; leftIndex < writers.length; leftIndex += 1) {
+    for (let rightIndex = leftIndex + 1; rightIndex < writers.length; rightIndex += 1) {
+      const left = writers[leftIndex]
+      const right = writers[rightIndex]
+      const ordered = taskDependsOn(byID, left.id, right.id) || taskDependsOn(byID, right.id, left.id)
+      if (ordered) continue
+      const overlap = left.scope.some((leftScope) => right.scope.some((rightScope) => scopesOverlap(leftScope, rightScope)))
+      if (overlap) {
+        throw new InputError(
+          `parallel mutating tasks ${left.id} and ${right.id} have overlapping scopes; add a dependency or split the scopes`,
+        )
+      }
+    }
+  }
+}
+
+function executionWaves(tasks) {
+  const pending = new Set(tasks.map((task) => task.id))
+  const completed = new Set()
+  const waves = []
+  while (pending.size > 0) {
+    const wave = tasks
+      .filter((task) => pending.has(task.id) && task.depends_on.every((dependency) => completed.has(dependency)))
+      .map((task) => task.id)
+      .sort()
+    if (wave.length === 0) throw new InputError("task dependency graph cannot be scheduled")
+    waves.push(wave)
+    for (const id of wave) {
+      pending.delete(id)
+      completed.add(id)
+    }
+  }
+  return waves
+}
+
+function roleRequirements(complexity, changesCode, tasks) {
+  const roles = new Set(tasks.map((task) => task.role))
+  const mutatingWorkers = tasks.filter((task) => task.role === "worker" && task.mutates)
+  const errors = []
+  if (![...roles].some((role) => role === "explorer" || role === "worker")) {
+    errors.push("at least one explorer or worker is required")
+  }
+  if (changesCode && mutatingWorkers.length === 0) errors.push("code-changing plans require a mutating worker")
+  if (!changesCode && mutatingWorkers.length > 0) errors.push("read-only plans cannot contain mutating workers")
+  if (changesCode && !roles.has("tester")) errors.push("code-changing plans require an independent tester")
+  if (["medium", "high", "critical"].includes(complexity) && !roles.has("critic")) {
+    errors.push(`${complexity} plans require an independent critic`)
+  }
+  if (["high", "critical"].includes(complexity) && !roles.has("explorer")) {
+    errors.push(`${complexity} plans require a read-only explorer before implementation`)
+  }
+  if (errors.length) throw new InputError("plan is missing mandatory roles", errors)
+}
+
+function summarizeAttempt(task) {
+  const attempt = task.attempts.at(-1)
+  if (!attempt) return undefined
+  return {
+    status: attempt.report.status,
+    summary: attempt.report.summary,
+    confidence: attempt.report.confidence,
+    files_changed: attempt.report.files_changed,
+    tests: attempt.report.tests,
+    risks: attempt.report.risks,
+    blockers: attempt.report.blockers,
+    verdict: attempt.report.verdict,
+    task_session_id: attempt.task_session_id,
+    verified_delta: attempt.verified_delta,
+    recorded_at: attempt.recorded_at,
+    invalidated_at: attempt.invalidated_at,
+    invalidated_by: attempt.invalidated_by,
+  }
+}
+
+function readyTasks(run) {
+  return run.tasks.filter(
+    (task) => task.state === "pending" && task.depends_on.every((dependency) => run.tasksByID[dependency]?.state === "complete"),
+  )
+}
+
+function dependencyContext(run, task) {
+  return task.depends_on.map((dependency) => {
+    const source = run.tasksByID[dependency]
+    return {
+      task_id: dependency,
+      role: source.role,
+      result: summarizeAttempt(source),
+    }
+  })
+}
+
+const ROLE_RULES = Object.freeze({
+  explorer: [
+    "Read and search only; do not modify repository files.",
+    "Map the relevant code paths, invariants, conventions, and likely failure modes.",
+    "Return concrete file paths and evidence, not broad speculation.",
+  ],
+  worker: [
+    "Implement only inside the declared scope.",
+    "Do not broaden the architecture or opportunistically refactor unrelated code.",
+    "Run the assigned validation that is safe and package-scoped.",
+  ],
+  tester: [
+    "Independently inspect the final working tree and run local package-scoped validation.",
+    "Do not edit files. Report exact commands, pass/fail status, and relevant output.",
+    "Look for regressions outside the happy path and verify stated acceptance criteria.",
+  ],
+  critic: [
+    "Assume the implementation may be wrong. Inspect the final tree and diff independently.",
+    "Do not edit files. Challenge correctness, scope, tests, security, compatibility, and maintainability.",
+    "Return verdict pass only when every acceptance criterion has concrete evidence.",
+  ],
+  synthesizer: [
+    "Do not edit or run tools. Reconcile the supplied worker reports into a concise decision brief.",
+    "Preserve disagreements, unresolved risks, and confidence rather than averaging them away.",
+  ],
+})
+

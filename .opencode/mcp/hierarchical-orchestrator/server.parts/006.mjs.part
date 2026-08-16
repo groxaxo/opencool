@@ -1,0 +1,116 @@
+async function handleMessage(message) {
+  if (!isObject(message) || message.jsonrpc !== "2.0" || typeof message.method !== "string") {
+    errorResponse(message?.id ?? null, -32600, "Invalid Request")
+    return
+  }
+  const hasID = Object.prototype.hasOwnProperty.call(message, "id")
+  const id = message.id
+
+  if (message.method === "notifications/initialized" || message.method === "notifications/cancelled") return
+
+  if (message.method === "initialize") {
+    if (!hasID) return
+    const requested =
+      isObject(message.params) && typeof message.params.protocolVersion === "string"
+        ? message.params.protocolVersion
+        : PROTOCOL_VERSION
+    const negotiated = SUPPORTED_PROTOCOL_VERSIONS.has(requested) ? requested : PROTOCOL_VERSION
+    response(id, {
+      protocolVersion: negotiated,
+      capabilities: { tools: { listChanged: false } },
+      serverInfo: { name: SERVER_NAME, version: SERVER_VERSION },
+      instructions: SERVER_INSTRUCTIONS,
+    })
+    return
+  }
+
+  if (message.method === "ping") {
+    if (hasID) response(id, {})
+    return
+  }
+
+  if (message.method === "tools/list") {
+    if (hasID) response(id, { tools })
+    return
+  }
+
+  if (message.method === "tools/call") {
+    if (!hasID) return
+    let params
+    let name
+    try {
+      params = requireObject(message.params, "params")
+      name = requiredString(params.name, "params.name")
+    } catch (error) {
+      errorResponse(id, -32602, "Invalid params", error instanceof Error ? error.message : String(error))
+      return
+    }
+    const handler = handlers[name]
+    if (!handler) {
+      response(id, textResult({ error: `unknown tool: ${name}` }, true))
+      return
+    }
+    try {
+      response(id, textResult(await handler(params.arguments ?? {})))
+    } catch (error) {
+      const payload = {
+        error: error instanceof Error ? error.message : String(error),
+        ...(error instanceof InputError && error.details.length ? { details: error.details } : {}),
+      }
+      response(id, textResult(payload, true))
+    }
+    return
+  }
+
+  if (hasID) errorResponse(id, -32601, `Method not found: ${message.method}`)
+}
+
+let buffer = ""
+let queue = Promise.resolve()
+process.stdin.setEncoding("utf8")
+process.stdin.on("data", (chunk) => {
+  buffer += chunk
+  while (true) {
+    const newline = buffer.indexOf("\n")
+    if (newline === -1) break
+    const raw = buffer.slice(0, newline).trim()
+    buffer = buffer.slice(newline + 1)
+    if (!raw) continue
+    queue = queue
+      .then(async () => {
+        let message
+        try {
+          message = JSON.parse(raw)
+        } catch (error) {
+          errorResponse(null, -32700, "Parse error", error instanceof Error ? error.message : String(error))
+          return
+        }
+        if (Array.isArray(message)) {
+          for (const item of message) await handleMessage(item)
+          return
+        }
+        await handleMessage(message)
+      })
+      .catch((error) => {
+        process.stderr.write(`[${SERVER_NAME}] ${error instanceof Error ? error.stack || error.message : String(error)}\n`)
+      })
+  }
+})
+
+process.stdin.on("end", () => {
+  if (buffer.trim()) {
+    try {
+      const message = JSON.parse(buffer)
+      queue = queue.then(() => handleMessage(message))
+    } catch {
+      errorResponse(null, -32700, "Parse error")
+    }
+  }
+  queue.finally(() => process.exit(0))
+})
+
+for (const signal of ["SIGINT", "SIGTERM"]) {
+  process.on(signal, () => process.exit(0))
+}
+
+await ensureStateDirs()

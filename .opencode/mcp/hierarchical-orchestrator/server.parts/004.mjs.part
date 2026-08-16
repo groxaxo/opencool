@@ -1,0 +1,290 @@
+function normalizeRisks(value) {
+  if (value === undefined) return []
+  if (!Array.isArray(value)) throw new InputError("report.risks must be an array")
+  return value.map((entry, index) => {
+    const item = requireObject(entry, `report.risks[${index}]`)
+    return {
+      severity: enumValue(item.severity, `report.risks[${index}].severity`, RISK_SEVERITIES),
+      description: requiredString(item.description, `report.risks[${index}].description`),
+      resolved: optionalBoolean(item.resolved, `report.risks[${index}].resolved`, false),
+    }
+  })
+}
+
+function normalizeAcceptanceEvidence(value, run) {
+  if (value === undefined) return []
+  if (!Array.isArray(value)) throw new InputError("report.acceptance_evidence must be an array")
+  const allowed = new Set(run.acceptance)
+  return value.map((entry, index) => {
+    const item = requireObject(entry, `report.acceptance_evidence[${index}]`)
+    const criterion = requiredString(item.criterion, `report.acceptance_evidence[${index}].criterion`)
+    if (!allowed.has(criterion)) {
+      throw new InputError(`report.acceptance_evidence[${index}].criterion is not a declared acceptance criterion`)
+    }
+    return {
+      criterion,
+      evidence: requiredString(item.evidence, `report.acceptance_evidence[${index}].evidence`),
+    }
+  })
+}
+
+function globToRegExp(glob) {
+  let expression = "^"
+  for (let index = 0; index < glob.length; index += 1) {
+    const char = glob[index]
+    const next = glob[index + 1]
+    const after = glob[index + 2]
+    if (char === "*" && next === "*" && after === "/") {
+      expression += "(?:.*/)?"
+      index += 2
+      continue
+    }
+    if (char === "*" && next === "*") {
+      expression += ".*"
+      index += 1
+      continue
+    }
+    if (char === "*") {
+      expression += "[^/]*"
+      continue
+    }
+    if (char === "?") {
+      expression += "[^/]"
+      continue
+    }
+    expression += char.replace(/[|\\{}()[\]^$+?.]/g, "\\$&")
+  }
+  expression += "$"
+  return new RegExp(expression)
+}
+
+function inScope(file, scopes) {
+  const normalized = normalizeScopeItem(file, "report.files_changed item")
+  return scopes.some((scope) => {
+    if (scope === normalized || normalized.startsWith(`${scope}/`)) return true
+    return globToRegExp(scope).test(normalized)
+  })
+}
+
+function setDifference(left, right) {
+  const target = new Set(right)
+  return left.filter((item) => !target.has(item))
+}
+
+function normalizeReport(value, task, run, actualPaths) {
+  const input = requireObject(value, "report")
+  const status = enumValue(input.status, "report.status", STATUSES)
+  const summary = requiredString(input.summary, "report.summary")
+  const reportConfidence = confidence(input.confidence, "report.confidence")
+  const filesChanged = stringArray(input.files_changed, "report.files_changed", { optional: true })
+    .map((item, index) => normalizeScopeItem(item, `report.files_changed[${index}]`))
+    .sort()
+  const actual = [...new Set(actualPaths)].sort()
+
+  if (!task.mutates && filesChanged.length > 0) {
+    throw new InputError(`read-only task ${task.id} reported changed files`, filesChanged)
+  }
+  if (!task.mutates && actual.length > 0) {
+    throw new InputError(`read-only task ${task.id} changed tracked or unignored repository state`, actual)
+  }
+  if (task.mutates) {
+    const outside = actual.filter((file) => !inScope(file, task.scope))
+    if (outside.length) throw new InputError(`task ${task.id} changed files outside its declared scope`, outside)
+    const omitted = setDifference(actual, filesChanged)
+    const invented = setDifference(filesChanged, actual)
+    if (omitted.length || invented.length) {
+      throw new InputError(`task ${task.id} report.files_changed does not match the verified workspace delta`, [
+        ...(omitted.length ? [`missing from report: ${omitted.join(", ")}`] : []),
+        ...(invented.length ? [`not present in delta: ${invented.join(", ")}`] : []),
+      ])
+    }
+    if (status === "complete" && actual.length === 0 && task.attempts.length === 0) {
+      throw new InputError(`first completed attempt for mutating task ${task.id} has no verified repository change`)
+    }
+  }
+
+  const verdict = input.verdict === undefined ? "not_applicable" : enumValue(input.verdict, "report.verdict", VERDICTS)
+  if (task.role === "critic" && status === "complete" && verdict === "not_applicable") {
+    throw new InputError(`critic task ${task.id} must return verdict pass, revise, or fail`)
+  }
+  if (task.role !== "critic" && verdict !== "not_applicable") {
+    throw new InputError(`non-critic task ${task.id} must use verdict not_applicable`)
+  }
+
+  return {
+    status,
+    summary,
+    confidence: reportConfidence,
+    files_changed: filesChanged,
+    tests: normalizeTests(input.tests),
+    risks: normalizeRisks(input.risks),
+    blockers: stringArray(input.blockers, "report.blockers", { optional: true }),
+    evidence: stringArray(input.evidence, "report.evidence", { optional: true }),
+    acceptance_evidence: normalizeAcceptanceEvidence(input.acceptance_evidence, run),
+    verdict,
+  }
+}
+
+function validateTaskSessionID(run, task, taskSessionID) {
+  for (const candidate of run.tasks) {
+    if (candidate.id === task.id) continue
+    if (candidate.attempts.some((attempt) => attempt.task_session_id === taskSessionID)) {
+      throw new InputError(
+        `task_session_id ${taskSessionID} is already used by independent task ${candidate.id}; each task must use a distinct child session`,
+      )
+    }
+  }
+}
+
+function dependentTasks(run, sourceID) {
+  refreshIndex(run)
+  const found = []
+  const queue = [sourceID]
+  const seen = new Set([sourceID])
+  while (queue.length > 0) {
+    const current = queue.shift()
+    for (const task of run.tasks) {
+      if (seen.has(task.id) || !task.depends_on.includes(current)) continue
+      seen.add(task.id)
+      queue.push(task.id)
+      found.push(task)
+    }
+  }
+  return found
+}
+
+function invalidateDependents(run, sourceTask) {
+  const invalidatedAt = new Date().toISOString()
+  const invalidated = []
+  for (const task of dependentTasks(run, sourceTask.id)) {
+    const latest = task.attempts.at(-1)
+    if (task.state === "pending" && !task.packet && !latest) continue
+    if (latest) {
+      latest.invalidated_at = invalidatedAt
+      latest.invalidated_by = { task_id: sourceTask.id, attempt: sourceTask.attempts.length }
+    }
+    invalidated.push(task.id)
+    task.state = "pending"
+    task.packet = undefined
+    task.invalidated_by = {
+      task_id: sourceTask.id,
+      attempt: sourceTask.attempts.length,
+      invalidated_at: invalidatedAt,
+    }
+  }
+  return invalidated
+}
+
+async function orchestratorRecord(raw) {
+  const input = requireObject(raw, "arguments")
+  const run = refreshIndex(await loadRun(requiredString(input.run_id, "run_id")))
+  if (run.status !== "open") throw new InputError(`run ${run.id} is ${run.status}`)
+  const taskID = requiredString(input.task_id, "task_id")
+  const task = run.tasksByID[taskID]
+  if (!task) throw new InputError(`unknown task_id ${taskID} in run ${run.id}`)
+  const incompleteDependencies = task.depends_on.filter((dependency) => run.tasksByID[dependency].state !== "complete")
+  if (incompleteDependencies.length) {
+    throw new InputError(`task ${taskID} cannot be recorded before its dependencies complete`, incompleteDependencies)
+  }
+
+  const packetID = requiredString(input.packet_id, "packet_id")
+  if (!task.packet) throw new InputError(`task ${taskID} has no active packet; call orchestrator_packet first`)
+  if (task.packet.id !== packetID) throw new InputError(`packet_id does not match the active packet for task ${taskID}`)
+  if (task.packet.expected_attempt !== task.attempts.length + 1) {
+    throw new InputError(`packet for task ${taskID} is stale; request a new packet`)
+  }
+
+  const taskSessionID = requiredString(input.task_session_id, "task_session_id")
+  validateTaskSessionID(run, task, taskSessionID)
+
+  const [currentWorkspace, currentRepository] = await Promise.all([workspaceSnapshot(), repositoryControlSnapshot()])
+  if (!currentWorkspace.available) {
+    throw new InputError(`cannot verify task ${taskID} workspace state: ${currentWorkspace.reason}`)
+  }
+  if (!currentRepository.available) {
+    throw new InputError(`cannot verify task ${taskID} Git control state: ${currentRepository.reason}`)
+  }
+  if (currentRepository.digest !== task.packet.repository_guard.digest) {
+    throw new InputError(
+      `task ${taskID} changed protected Git control state; restore HEAD, branch, index, refs, stash, remotes, worktrees, and local config before recording`,
+    )
+  }
+
+  const delta = workspaceDelta(task.packet.workspace_guard, currentWorkspace)
+  if (!delta.available) throw new InputError(`cannot calculate the verified workspace delta for task ${taskID}`)
+  if (delta.head_changed) {
+    throw new InputError(`task ${taskID} changed the repository root or HEAD and cannot be recorded`)
+  }
+  if (!task.mutates && currentWorkspace.digest !== task.packet.workspace_guard.digest) {
+    throw new InputError(
+      `read-only task ${taskID} changed tracked or unignored repository state; revert the mutation and rerun the task`,
+      delta.paths,
+    )
+  }
+
+  const report = normalizeReport(input.report, task, run, delta.paths)
+  const attempt = {
+    attempt: task.attempts.length + 1,
+    task_session_id: taskSessionID,
+    recorded_at: new Date().toISOString(),
+    report,
+    verified_delta: delta.paths,
+    workspace_after: publicSnapshot(currentWorkspace),
+    repository_after: publicSnapshot(currentRepository),
+  }
+  task.attempts.push(attempt)
+  task.state = report.status
+  task.packet = undefined
+  task.invalidated_by = undefined
+  const invalidatedTasks = invalidateDependents(run, task)
+  run.current_guard = {
+    workspace: publicSnapshot(currentWorkspace),
+    repository: publicSnapshot(currentRepository),
+  }
+  run.gate = undefined
+  refreshIndex(run)
+  await saveRun(run)
+
+  const ready = readyTasks(run)
+  return {
+    run_id: run.id,
+    recorded: { task_id: task.id, state: task.state, attempt: attempt.attempt },
+    invalidated_tasks: invalidatedTasks,
+    verified_delta: delta.paths,
+    ready_tasks: ready.map((candidate) => ({
+      task_id: candidate.id,
+      role: candidate.role,
+      subagent_type: candidate.agent,
+      objective: candidate.objective,
+    })),
+    next_action:
+      ready.length > 0
+        ? "Call hierarchy_orchestrator_packet for each ready task, execute through native task, and record the result. Only read-only ready packets may run concurrently."
+        : "Call hierarchy_orchestrator_gate. If it returns revise, use hierarchy_orchestrator_packet with feedback and resume the relevant task session.",
+  }
+}
+
+function statusView(run) {
+  refreshIndex(run)
+  const ready = readyTasks(run)
+  return {
+    run_id: run.id,
+    status: run.status,
+    objective: run.objective,
+    complexity: run.complexity,
+    changes_code: run.changes_code,
+    policy: run.policy,
+    current_guard: run.current_guard,
+    migration: run.migration,
+    last_gate: run.gate,
+    tasks: run.tasks.map(publicTask),
+    ready_tasks: ready.map((task) => ({ task_id: task.id, role: task.role, subagent_type: task.agent })),
+    blocked_tasks: run.tasks
+      .filter((task) => task.state === "pending" && !ready.includes(task))
+      .map((task) => ({
+        task_id: task.id,
+        blocked_by: task.depends_on.filter((dependency) => run.tasksByID[dependency].state !== "complete"),
+      })),
+  }
+}
+
