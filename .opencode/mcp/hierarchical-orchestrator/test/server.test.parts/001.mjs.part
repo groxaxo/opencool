@@ -1,0 +1,220 @@
+test("worker tasks are dependency-serialized even when their scopes are disjoint or overlapping", async (t) => {
+  const client = await startClient(t)
+  const plan = {
+    objective: "Implement two bounded changes with one independent tester",
+    complexity: "low",
+    changes_code: true,
+    constraints: [],
+    acceptance: [criterion],
+    workstreams: [
+      { id: "worker-a", role: "worker", objective: "Implement the first bounded change", scope: ["src/**"] },
+      { id: "worker-b", role: "worker", objective: "Implement the second bounded change", scope: ["src/**"] },
+      { id: "test", role: "tester", objective: "Independently test both bounded changes", scope: ["src/**", "test/**"] },
+    ],
+  }
+  const planned = await client.call("orchestrator_plan", plan)
+  assert.equal(planned.isError, undefined)
+  assert.deepEqual(planned.structuredContent.execution_waves, [["worker-a"], ["worker-b"], ["test"]])
+  assert.equal(planned.structuredContent.policy.mutation_order, "serialized")
+})
+
+test("a complete planner-worker-tester-critic lifecycle passes, gates, archives, and uses private state", async (t) => {
+  const client = await startClient(t)
+  const { runID } = await finishHighRun(client)
+
+  const gateResult = await client.call("orchestrator_gate", { run_id: runID })
+  assert.equal(gateResult.structuredContent.decision, "pass")
+  assert.match(gateResult.structuredContent.evidence.join("\n"), /test passed/i)
+
+  if (process.platform !== "win32") {
+    const mode = (await stat(path.join(client.stateDir, `${runID}.json`))).mode & 0o777
+    assert.equal(mode, 0o600)
+  }
+
+  const closed = await client.call("orchestrator_close", { run_id: runID, outcome: "accepted" })
+  assert.equal(closed.structuredContent.archived, true)
+  await stat(path.join(client.stateDir, "archive", `${runID}.json`))
+})
+
+test("recording verifies the actual workspace delta, declared scope, and exact reported file list", async (t) => {
+  const client = await startClient(t)
+  const plan = {
+    objective: "Implement one bounded source change and validate it independently",
+    complexity: "low",
+    changes_code: true,
+    constraints: [],
+    acceptance: [criterion],
+    workstreams: [
+      { id: "implement", role: "worker", objective: "Implement only the source feature", scope: ["src/**"] },
+      { id: "test", role: "tester", objective: "Validate the source feature independently", scope: ["src/**", "test/**"] },
+    ],
+  }
+  const planned = await client.call("orchestrator_plan", plan)
+  const runID = planned.structuredContent.run_id
+  const packet = planned.structuredContent.ready_tasks[0]
+
+  await write(client.root, "docs/oops.md", "outside\n")
+  const outside = await record(client, runID, "implement", packet.packet_id, "session-worker", report({ files_changed: ["docs/oops.md"] }))
+  expectToolError(outside, /outside its declared scope/i)
+  await rm(path.join(client.root, "docs"), { recursive: true, force: true })
+
+  await write(client.root, "src/feature.js", "export const feature = 1\n")
+  const invented = await record(client, runID, "implement", packet.packet_id, "session-worker", report({ files_changed: ["src/invented.js"] }))
+  const details = expectToolError(invented, /does not match the verified workspace delta/i)
+  assert.match(details.details.join("\n"), /missing from report: src\/feature\.js/)
+  assert.match(details.details.join("\n"), /not present in delta: src\/invented\.js/)
+
+  const accepted = await record(client, runID, "implement", packet.packet_id, "session-worker", report({ files_changed: ["src/feature.js"] }))
+  assert.deepEqual(accepted.structuredContent.verified_delta, ["src/feature.js"])
+})
+
+test("read-only packets detect content changes to an already-untracked file", async (t) => {
+  const client = await startClient(t)
+  await write(client.root, "notes.txt", "before\n")
+  const planned = await client.call("orchestrator_plan", lowReadOnlyPlan())
+  const runID = planned.structuredContent.run_id
+  const packet = planned.structuredContent.ready_tasks[0]
+
+  await write(client.root, "notes.txt", "after\n")
+  const changed = await record(client, runID, "inspect", packet.packet_id, "session-inspect", report())
+  expectToolError(changed, /read-only task inspect changed/i)
+
+  await write(client.root, "notes.txt", "before\n")
+  const accepted = await record(client, runID, "inspect", packet.packet_id, "session-inspect", report())
+  assert.equal(accepted.isError, undefined)
+  const gateResult = await client.call("orchestrator_gate", { run_id: runID })
+  assert.equal(gateResult.structuredContent.decision, "pass")
+})
+
+test("records reject staging and other protected Git-control mutations", async (t) => {
+  const client = await startClient(t)
+  await write(client.root, "notes.txt", "untracked\n")
+  const planned = await client.call("orchestrator_plan", lowReadOnlyPlan())
+  const runID = planned.structuredContent.run_id
+  const packet = planned.structuredContent.ready_tasks[0]
+
+  await client.git("add", "notes.txt")
+  const staged = await record(client, runID, "inspect", packet.packet_id, "session-inspect", report())
+  expectToolError(staged, /protected Git control state/i)
+
+  await client.git("reset", "-q", "HEAD", "--", "notes.txt")
+  const accepted = await record(client, runID, "inspect", packet.packet_id, "session-inspect", report())
+  assert.equal(accepted.isError, undefined)
+})
+
+test("active packets require intentional rotation and dependencies cannot be bypassed", async (t) => {
+  const client = await startClient(t)
+  const planned = await client.call("orchestrator_plan", highCodePlan())
+  const runID = planned.structuredContent.run_id
+  const original = planned.structuredContent.ready_tasks[0]
+
+  expectToolError(await client.call("orchestrator_packet", { run_id: runID, task_id: "inspect" }), /already has an active packet/i)
+  expectToolError(
+    await client.call("orchestrator_packet", { run_id: runID, task_id: "implement", replace_active: true }),
+    /blocked by incomplete dependencies/i,
+  )
+
+  const rotated = await client.call("orchestrator_packet", {
+    run_id: runID,
+    task_id: "inspect",
+    replace_active: true,
+    feedback: "Use the refreshed packet",
+  })
+  assert.notEqual(rotated.structuredContent.packet.packet_id, original.packet_id)
+
+  const stale = await record(client, runID, "inspect", original.packet_id, "session-inspect", report())
+  expectToolError(stale, /does not match the active packet/i)
+  const accepted = await record(
+    client,
+    runID,
+    "inspect",
+    rotated.structuredContent.packet.packet_id,
+    "session-inspect",
+    report(),
+  )
+  assert.equal(accepted.isError, undefined)
+})
+
+test("task session IDs are mandatory and cannot be shared across independent tasks", async (t) => {
+  const client = await startClient(t)
+  const plan = lowReadOnlyPlan([
+    { id: "inspect-a", role: "explorer", objective: "Inspect the first bounded area", scope: ["src/**"] },
+    { id: "inspect-b", role: "explorer", objective: "Inspect the second bounded area", scope: ["test/**"] },
+  ])
+  const planned = await client.call("orchestrator_plan", plan)
+  const runID = planned.structuredContent.run_id
+  const byID = Object.fromEntries(planned.structuredContent.ready_tasks.map((packet) => [packet.task_id, packet]))
+
+  const missing = await client.call("orchestrator_record", {
+    run_id: runID,
+    task_id: "inspect-a",
+    packet_id: byID["inspect-a"].packet_id,
+    report: report(),
+  })
+  expectToolError(missing, /task_session_id must be a string/i)
+
+  await record(client, runID, "inspect-a", byID["inspect-a"].packet_id, "shared-session", report())
+  const shared = await record(client, runID, "inspect-b", byID["inspect-b"].packet_id, "shared-session", report())
+  expectToolError(shared, /already used by independent task inspect-a/i)
+  const accepted = await record(client, runID, "inspect-b", byID["inspect-b"].packet_id, "session-b", report())
+  assert.equal(accepted.isError, undefined)
+})
+
+test("retrying an upstream worker invalidates stale tester and critic evidence", async (t) => {
+  const client = await startClient(t)
+  const { runID } = await finishHighRun(client)
+  const firstGate = await client.call("orchestrator_gate", { run_id: runID })
+  assert.equal(firstGate.structuredContent.decision, "pass")
+
+  const retry = await client.call("orchestrator_packet", {
+    run_id: runID,
+    task_id: "implement",
+    feedback: "Reassess the implementation after review",
+  })
+  const retried = await record(
+    client,
+    runID,
+    "implement",
+    retry.structuredContent.packet.packet_id,
+    "session-worker",
+    report({ files_changed: [] }),
+  )
+  assert.deepEqual(retried.structuredContent.invalidated_tasks.sort(), ["review", "test"])
+
+  const staleGate = await client.call("orchestrator_gate", { run_id: runID })
+  assert.equal(staleGate.structuredContent.decision, "revise")
+  assert.match(staleGate.structuredContent.reasons.join("\n"), /task test is pending/)
+  assert.match(staleGate.structuredContent.reasons.join("\n"), /task review is pending/)
+
+  const tester = await client.call("orchestrator_packet", { run_id: runID, task_id: "test" })
+  await record(
+    client,
+    runID,
+    "test",
+    tester.structuredContent.packet.packet_id,
+    "session-test",
+    report({ tests: [{ command: "node --test test/feature.test.mjs", status: "pass", summary: "passed" }] }),
+  )
+  const critic = await client.call("orchestrator_packet", { run_id: runID, task_id: "review" })
+  await record(client, runID, "review", critic.structuredContent.packet.packet_id, "session-review", report({ verdict: "pass" }))
+
+  const freshGate = await client.call("orchestrator_gate", { run_id: runID })
+  assert.equal(freshGate.structuredContent.decision, "pass")
+})
+
+test("the gate requires independent exact validation, critic approval, and adequate confidence", async (t) => {
+  const client = await startClient(t)
+  const testerReport = report({
+    confidence: 0.5,
+    tests: [{ command: "node --test test/feature.test.mjs", status: "fail", summary: "regression" }],
+  })
+  const criticReport = report({ verdict: "revise", confidence: 0.6 })
+  const { runID } = await finishHighRun(client, { testerReport, criticReport })
+  const gateResult = await client.call("orchestrator_gate", { run_id: runID })
+  assert.equal(gateResult.structuredContent.decision, "revise")
+  const reasons = gateResult.structuredContent.reasons.join("\n")
+  assert.match(reasons, /confidence .* below/i)
+  assert.match(reasons, /validation fail/i)
+  assert.match(reasons, /critic review verdict is revise/i)
+})
+

@@ -1,0 +1,96 @@
+test("changes after final evidence or a passing gate block acceptance", async (t) => {
+  const client = await startClient(t)
+  const { runID } = await finishHighRun(client)
+  const gateResult = await client.call("orchestrator_gate", { run_id: runID })
+  assert.equal(gateResult.structuredContent.decision, "pass")
+
+  await write(client.root, "src/feature.js", "export const feature = 99\n")
+  const regated = await client.call("orchestrator_gate", { run_id: runID })
+  assert.equal(regated.structuredContent.decision, "revise")
+  assert.match(regated.structuredContent.reasons.join("\n"), /changed after the last recorded packet|changed after final evidence/i)
+
+  const closed = await client.call("orchestrator_close", { run_id: runID, outcome: "accepted" })
+  expectToolError(closed, /cannot accept a run that does not pass the gate/i)
+})
+
+test("record reports may reference only declared acceptance criteria", async (t) => {
+  const client = await startClient(t)
+  const planned = await client.call("orchestrator_plan", lowReadOnlyPlan())
+  const packet = planned.structuredContent.ready_tasks[0]
+  const invalid = await record(
+    client,
+    planned.structuredContent.run_id,
+    "inspect",
+    packet.packet_id,
+    "session-inspect",
+    report({ acceptance_evidence: [{ criterion: "Invented criterion", evidence: "invented" }] }),
+  )
+  expectToolError(invalid, /not a declared acceptance criterion/i)
+})
+
+test("legacy version-1 run state migrates safely by invalidating unverifiable evidence", async (t) => {
+  const client = await startClient(t)
+  const runID = "orch-20260816-deadbeef"
+  const now = new Date().toISOString()
+  await mkdir(client.stateDir, { recursive: true })
+  await writeFile(
+    path.join(client.stateDir, `${runID}.json`),
+    `${JSON.stringify(
+      {
+        version: 1,
+        id: runID,
+        status: "open",
+        created_at: now,
+        updated_at: now,
+        objective: "Inspect a legacy run safely",
+        complexity: "low",
+        changes_code: false,
+        constraints: [],
+        acceptance: [criterion],
+        policy: {
+          min_confidence: 0.6,
+          requires_tests: false,
+          requires_critic: false,
+          requires_explorer: false,
+        },
+        waves: [["inspect"]],
+        tasks: [
+          {
+            id: "inspect",
+            role: "explorer",
+            agent: "qwen-explorer",
+            objective: "Inspect legacy repository evidence",
+            scope: ["src/**"],
+            deliverables: [],
+            validation: [],
+            depends_on: [],
+            mutates: false,
+            state: "complete",
+            attempts: [
+              {
+                attempt: 1,
+                task_session_id: "legacy-session",
+                recorded_at: now,
+                report: report(),
+              },
+            ],
+          },
+        ],
+      },
+      null,
+      2,
+    )}\n`,
+    "utf8",
+  )
+
+  const status = await client.call("orchestrator_status", { run_id: runID })
+  assert.equal(status.structuredContent.migration.from_version, 1)
+  assert.equal(status.structuredContent.tasks[0].state, "pending")
+  assert.match(status.structuredContent.tasks[0].latest.invalidated_by.task_id, /state-migration/)
+
+  const packet = await client.call("orchestrator_packet", { run_id: runID, task_id: "inspect" })
+  assert.equal(packet.isError, undefined)
+  const persisted = JSON.parse(await readFile(path.join(client.stateDir, `${runID}.json`), "utf8"))
+  assert.equal(persisted.version, 2)
+  assert.equal(persisted.policy.scope_enforcement, "verified-workspace-delta")
+})

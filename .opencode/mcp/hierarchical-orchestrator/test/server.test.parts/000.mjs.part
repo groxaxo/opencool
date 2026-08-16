@@ -1,0 +1,293 @@
+import assert from "node:assert/strict"
+import { execFile, spawn } from "node:child_process"
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises"
+import os from "node:os"
+import path from "node:path"
+import test from "node:test"
+import { promisify } from "node:util"
+import { fileURLToPath } from "node:url"
+
+const here = process.env.OPENCODE_HIERARCHY_TEST_HERE || path.dirname(fileURLToPath(import.meta.url))
+const server = path.resolve(here, "../server.mjs")
+const execFileAsync = promisify(execFile)
+const criterion = "The feature is implemented and locally validated"
+
+function waitForExit(child) {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve()
+  return new Promise((resolve) => child.once("exit", resolve))
+}
+
+async function git(root, ...args) {
+  return execFileAsync("git", args, { cwd: root })
+}
+
+async function write(root, file, content) {
+  const target = path.join(root, file)
+  await mkdir(path.dirname(target), { recursive: true })
+  await writeFile(target, content, "utf8")
+}
+
+async function initializeRepository(root) {
+  await git(root, "init", "-q")
+  await git(root, "config", "user.name", "Orchestrator Test")
+  await git(root, "config", "user.email", "orchestrator-test@example.invalid")
+  await write(root, "src/base.js", "export const base = true\n")
+  await write(
+    root,
+    "test/feature.test.mjs",
+    'import assert from "node:assert/strict"\nimport test from "node:test"\ntest("base", () => assert.equal(true, true))\n',
+  )
+  await write(root, "README.md", "# fixture\n")
+  await git(root, "add", ".")
+  await git(root, "commit", "-qm", "base")
+}
+
+async function startClient(t, options = {}) {
+  const root = await mkdtemp(path.join(os.tmpdir(), "opencool-orchestrator-test-"))
+  if (options.git !== false) await initializeRepository(root)
+  const stateDir = path.join(root, ".orchestrator-state")
+  const child = spawn(process.execPath, [server], {
+    cwd: root,
+    env: { ...process.env, OPENCODE_ORCHESTRATOR_STATE_DIR: stateDir },
+    stdio: ["pipe", "pipe", "pipe"],
+  })
+
+  let nextID = 1
+  let buffer = ""
+  let stderr = ""
+  const pending = new Map()
+
+  child.stdout.setEncoding("utf8")
+  child.stdout.on("data", (chunk) => {
+    buffer += chunk
+    while (true) {
+      const newline = buffer.indexOf("\n")
+      if (newline === -1) break
+      const raw = buffer.slice(0, newline).trim()
+      buffer = buffer.slice(newline + 1)
+      if (!raw) continue
+      const message = JSON.parse(raw)
+      const waiter = pending.get(message.id)
+      if (!waiter) continue
+      pending.delete(message.id)
+      waiter(message)
+    }
+  })
+  child.stderr.setEncoding("utf8")
+  child.stderr.on("data", (chunk) => {
+    stderr += chunk
+  })
+
+  function requestMessage(method, params) {
+    const id = nextID++
+    const promise = new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        pending.delete(id)
+        reject(new Error(`request timed out: ${method}\nstderr:\n${stderr}`))
+      }, 8_000)
+      pending.set(id, (message) => {
+        clearTimeout(timeout)
+        resolve(message)
+      })
+    })
+    child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`)
+    return promise
+  }
+
+  async function request(method, params) {
+    const message = await requestMessage(method, params)
+    if (message.error) throw new Error(JSON.stringify(message.error))
+    return message.result
+  }
+
+  function notify(method, params = {}) {
+    child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method, params })}\n`)
+  }
+
+  async function call(name, args) {
+    return request("tools/call", { name, arguments: args })
+  }
+
+  t.after(async () => {
+    for (const waiter of pending.values()) waiter({ error: { message: "server closed" } })
+    pending.clear()
+    child.stdin.end()
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM")
+    await waitForExit(child)
+    await rm(root, { recursive: true, force: true })
+  })
+
+  const initialized = await request("initialize", {
+    protocolVersion: options.protocol || "2025-06-18",
+    capabilities: {},
+    clientInfo: { name: "test", version: "1" },
+  })
+  notify("notifications/initialized")
+  return { request, requestMessage, call, initialized, root, stateDir, git: (...args) => git(root, ...args) }
+}
+
+function expectToolError(result, pattern) {
+  assert.equal(result.isError, true)
+  assert.match(result.structuredContent.error, pattern)
+  return result.structuredContent
+}
+
+function report(overrides = {}) {
+  return {
+    status: "complete",
+    summary: "Completed with concrete repository evidence",
+    confidence: 0.95,
+    files_changed: [],
+    tests: [],
+    risks: [],
+    blockers: [],
+    evidence: ["Inspected the relevant repository state"],
+    acceptance_evidence: [{ criterion, evidence: "Verified against the final working tree" }],
+    verdict: "not_applicable",
+    ...overrides,
+  }
+}
+
+function highCodePlan() {
+  return {
+    objective: "Implement a bounded repository feature with independent validation and adversarial review",
+    complexity: "high",
+    changes_code: true,
+    constraints: ["Preserve existing behavior", "Do not use GitHub Actions"],
+    acceptance: [criterion],
+    workstreams: [
+      {
+        id: "inspect",
+        role: "explorer",
+        objective: "Inspect relevant code paths and identify implementation constraints",
+        scope: ["src/**", "test/**"],
+      },
+      {
+        id: "implement",
+        role: "worker",
+        objective: "Implement the bounded feature without unrelated refactors",
+        scope: ["src/**"],
+        deliverables: ["Production implementation"],
+        validation: ["node --test test/feature.test.mjs"],
+      },
+      {
+        id: "test",
+        role: "tester",
+        objective: "Run independent local validation against the final working tree",
+        scope: ["src/**", "test/**"],
+      },
+      {
+        id: "review",
+        role: "critic",
+        objective: "Adversarially review the final implementation and evidence",
+        scope: ["src/**", "test/**"],
+      },
+    ],
+  }
+}
+
+function lowReadOnlyPlan(workstreams = undefined) {
+  return {
+    objective: "Inspect repository behavior without changing tracked or unignored state",
+    complexity: "low",
+    changes_code: false,
+    constraints: ["Remain read-only"],
+    acceptance: [criterion],
+    workstreams:
+      workstreams ||
+      [
+        {
+          id: "inspect",
+          role: "explorer",
+          objective: "Inspect the repository and return concrete evidence",
+          scope: ["src/**", "test/**"],
+        },
+      ],
+  }
+}
+
+async function record(client, runID, taskID, packetID, taskSessionID, taskReport) {
+  return client.call("orchestrator_record", {
+    run_id: runID,
+    task_id: taskID,
+    packet_id: packetID,
+    task_session_id: taskSessionID,
+    report: taskReport,
+  })
+}
+
+async function finishHighRun(client, options = {}) {
+  const planned = await client.call("orchestrator_plan", highCodePlan())
+  assert.equal(planned.isError, undefined)
+  const runID = planned.structuredContent.run_id
+  const inspectPacket = planned.structuredContent.ready_tasks[0]
+  await record(client, runID, "inspect", inspectPacket.packet_id, "session-inspect", report())
+
+  const worker = await client.call("orchestrator_packet", { run_id: runID, task_id: "implement" })
+  assert.equal(worker.isError, undefined)
+  if (options.writeFeature !== false) await write(client.root, "src/feature.js", "export const feature = 42\n")
+  await record(
+    client,
+    runID,
+    "implement",
+    worker.structuredContent.packet.packet_id,
+    "session-worker",
+    report({ files_changed: options.writeFeature === false ? [] : ["src/feature.js"] }),
+  )
+
+  const tester = await client.call("orchestrator_packet", { run_id: runID, task_id: "test" })
+  const testerReport =
+    options.testerReport ||
+    report({
+      tests: [{ command: "node --test test/feature.test.mjs", status: "pass", summary: "Focused test passed" }],
+    })
+  await record(client, runID, "test", tester.structuredContent.packet.packet_id, "session-test", testerReport)
+
+  const critic = await client.call("orchestrator_packet", { run_id: runID, task_id: "review" })
+  const criticReport = options.criticReport || report({ verdict: "pass" })
+  await record(client, runID, "review", critic.structuredContent.packet.packet_id, "session-review", criticReport)
+  return { runID }
+}
+
+test("MCP handshake negotiates supported protocol, exposes six tools, and returns invalid-params errors", async (t) => {
+  const client = await startClient(t, { protocol: "2099-01-01" })
+  assert.equal(client.initialized.protocolVersion, "2025-06-18")
+  assert.equal(client.initialized.serverInfo.name, "opencool-hierarchical-orchestrator")
+  assert.match(client.initialized.instructions, /native task tool/i)
+
+  const listed = await client.request("tools/list", {})
+  assert.deepEqual(
+    listed.tools.map((tool) => tool.name),
+    [
+      "orchestrator_plan",
+      "orchestrator_packet",
+      "orchestrator_record",
+      "orchestrator_status",
+      "orchestrator_gate",
+      "orchestrator_close",
+    ],
+  )
+
+  const invalid = await client.requestMessage("tools/call", null)
+  assert.equal(invalid.error.code, -32602)
+})
+
+test("planning requires Git and rejects root-wide or Git-control mutation scopes", async (t) => {
+  const noGit = await startClient(t, { git: false })
+  expectToolError(await noGit.call("orchestrator_plan", lowReadOnlyPlan()), /Git workspace snapshot/i)
+
+  const client = await startClient(t)
+  const broad = highCodePlan()
+  broad.workstreams.find((task) => task.id === "implement").scope = ["**"]
+  expectToolError(await client.call("orchestrator_plan", broad), /too broad/i)
+
+  const gitControl = highCodePlan()
+  gitControl.workstreams.find((task) => task.id === "implement").scope = [".git/**"]
+  expectToolError(await client.call("orchestrator_plan", gitControl), /cannot reference \.git/i)
+
+  const zeroDirectoryGlob = highCodePlan()
+  zeroDirectoryGlob.workstreams.find((task) => task.id === "implement").scope = ["src/**/feature.js"]
+  const accepted = await client.call("orchestrator_plan", zeroDirectoryGlob)
+  assert.equal(accepted.isError, undefined)
+})
+

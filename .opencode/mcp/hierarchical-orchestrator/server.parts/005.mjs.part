@@ -1,0 +1,238 @@
+async function listRecentRuns() {
+  await ensureStateDirs()
+  const names = (await readdir(stateDir, { withFileTypes: true }))
+    .filter((entry) => entry.isFile() && RUN_ID.test(entry.name.replace(/\.json$/, "")))
+    .map((entry) => entry.name.replace(/\.json$/, ""))
+  const runs = []
+  for (const id of names) {
+    try {
+      const run = await loadRun(id)
+      runs.push({ run_id: id, status: run.status, objective: run.objective, updated_at: run.updated_at })
+    } catch {}
+  }
+  return runs.sort((left, right) => right.updated_at.localeCompare(left.updated_at)).slice(0, 20)
+}
+
+async function orchestratorStatus(raw) {
+  const input = requireObject(raw ?? {}, "arguments")
+  if (input.run_id === undefined) return { runs: await listRecentRuns() }
+  return statusView(await loadRun(requiredString(input.run_id, "run_id")))
+}
+
+function gateRun(run, guards) {
+  refreshIndex(run)
+  const reasons = []
+  const evidence = []
+
+  if (!guards.workspace?.available) reasons.push(`workspace snapshot unavailable: ${guards.workspace?.reason || "unknown error"}`)
+  if (!guards.repository?.available) reasons.push(`Git control snapshot unavailable: ${guards.repository?.reason || "unknown error"}`)
+  if (guards.workspace?.available && run.current_guard?.workspace?.digest !== guards.workspace.digest) {
+    reasons.push("tracked or unignored repository state changed after the last recorded packet")
+  }
+  if (guards.repository?.available && run.current_guard?.repository?.digest !== guards.repository.digest) {
+    reasons.push("protected Git control state changed after the last recorded packet")
+  }
+
+  const latestAttempts = []
+  const sessionOwners = new Map()
+  for (const task of run.tasks) {
+    if (task.packet) reasons.push(`task ${task.id} has an active unrecorded packet`)
+    if (task.state !== "complete") reasons.push(`task ${task.id} is ${task.state}`)
+    const attempt = task.attempts.at(-1)
+    if (task.state === "complete" && !attempt) {
+      reasons.push(`task ${task.id} is complete without a recorded attempt`)
+      continue
+    }
+    if (!attempt || task.state !== "complete") continue
+    latestAttempts.push({ task, attempt })
+    if (attempt.invalidated_at) reasons.push(`task ${task.id} latest attempt was invalidated at ${attempt.invalidated_at}`)
+    if (!attempt.task_session_id) {
+      reasons.push(`task ${task.id} has no child task_session_id`)
+    } else {
+      const owner = sessionOwners.get(attempt.task_session_id)
+      if (owner && owner !== task.id) {
+        reasons.push(`tasks ${owner} and ${task.id} reused child session ${attempt.task_session_id}`)
+      } else {
+        sessionOwners.set(attempt.task_session_id, task.id)
+      }
+    }
+    for (const dependency of task.depends_on) {
+      const sourceAttempt = run.tasksByID[dependency]?.attempts.at(-1)
+      if (!sourceAttempt) {
+        reasons.push(`task ${task.id} lacks recorded dependency evidence from ${dependency}`)
+        continue
+      }
+      if (sourceAttempt.recorded_at > attempt.recorded_at) {
+        reasons.push(`task ${task.id} evidence predates the latest attempt for dependency ${dependency}`)
+      }
+    }
+  }
+
+  for (const { task, attempt } of latestAttempts) {
+    const report = attempt.report
+    if (report.blockers.length) reasons.push(`task ${task.id} has blockers: ${report.blockers.join("; ")}`)
+    for (const risk of report.risks) {
+      if (!risk.resolved && ["high", "critical"].includes(risk.severity)) {
+        reasons.push(`task ${task.id} has unresolved ${risk.severity} risk: ${risk.description}`)
+      }
+    }
+    if (["worker", "tester", "critic"].includes(task.role) && report.confidence < run.policy.min_confidence) {
+      reasons.push(
+        `task ${task.id} confidence ${report.confidence.toFixed(2)} is below ${run.policy.min_confidence.toFixed(2)}`,
+      )
+    }
+  }
+
+  const testerAttempts = latestAttempts.filter(({ task }) => task.role === "tester")
+  if (run.policy.requires_tests) {
+    if (testerAttempts.length === 0) reasons.push("no completed independent tester report")
+    const tests = testerAttempts.flatMap(({ attempt }) => attempt.report.tests)
+    if (!tests.some((test) => test.status === "pass")) reasons.push("no passing local validation command recorded")
+    for (const test of tests.filter((item) => item.status === "fail" || item.status === "not_run")) {
+      reasons.push(`validation ${test.status}: ${test.command}${test.summary ? ` (${test.summary})` : ""}`)
+    }
+    const requiredCommands = [
+      ...new Set(
+        run.tasks
+          .filter((task) => task.role === "worker" || task.role === "tester")
+          .flatMap((task) => task.validation),
+      ),
+    ]
+    for (const command of requiredCommands) {
+      const matches = tests.filter((test) => test.command === command)
+      const match = matches.at(-1)
+      if (!match) reasons.push(`required validation command was not recorded by an independent tester: ${command}`)
+      else if (match.status !== "pass") reasons.push(`required validation command did not pass: ${command} (${match.status})`)
+    }
+    evidence.push(...tests.filter((test) => test.status === "pass").map((test) => `test passed: ${test.command}`))
+  }
+
+  const critics = latestAttempts.filter(({ task }) => task.role === "critic")
+  if (run.policy.requires_critic && critics.length === 0) reasons.push("independent critic report is missing")
+  for (const { task, attempt } of critics) {
+    if (attempt.report.verdict !== "pass") reasons.push(`critic ${task.id} verdict is ${attempt.report.verdict}`)
+    else evidence.push(`critic ${task.id} passed`)
+  }
+
+  const acceptanceSources = run.policy.requires_critic
+    ? critics
+    : run.policy.requires_tests
+      ? testerAttempts
+      : latestAttempts
+  const acceptanceEvidence = acceptanceSources.flatMap(({ attempt }) => attempt.report.acceptance_evidence)
+  for (const criterion of run.acceptance) {
+    const matches = acceptanceEvidence.filter((item) => item.criterion === criterion && item.evidence.trim())
+    if (matches.length === 0) reasons.push(`acceptance criterion lacks exact independent evidence: ${criterion}`)
+    else evidence.push(`${criterion}: ${matches.at(-1).evidence}`)
+  }
+
+  const anchor = [...acceptanceSources].sort((left, right) => left.attempt.recorded_at.localeCompare(right.attempt.recorded_at)).at(-1)
+  if (!anchor) {
+    reasons.push("no final independent evidence snapshot is available")
+  } else {
+    if (!anchor.attempt.workspace_after?.available) {
+      reasons.push(`task ${anchor.task.id} has no verified post-task workspace snapshot`)
+    } else if (guards.workspace?.available && anchor.attempt.workspace_after.digest !== guards.workspace.digest) {
+      reasons.push(`repository state changed after final evidence task ${anchor.task.id}`)
+    }
+    if (!anchor.attempt.repository_after?.available) {
+      reasons.push(`task ${anchor.task.id} has no verified post-task Git control snapshot`)
+    } else if (guards.repository?.available && anchor.attempt.repository_after.digest !== guards.repository.digest) {
+      reasons.push(`Git control state changed after final evidence task ${anchor.task.id}`)
+    }
+  }
+
+  const uniqueReasons = [...new Set(reasons)]
+  return {
+    run_id: run.id,
+    decision: uniqueReasons.length === 0 ? "pass" : "revise",
+    reasons: uniqueReasons,
+    evidence: [...new Set(evidence)],
+    rule:
+      uniqueReasons.length === 0
+        ? "The primary architect may now deliver the final answer. Any further repository or Git-control mutation invalidates this gate and requires fresh independent evidence."
+        : "Do not declare completion. Repair the listed evidence gaps through bounded Qwen tasks, record new attempts, then rerun the gate.",
+  }
+}
+
+async function orchestratorGate(raw) {
+  const input = requireObject(raw, "arguments")
+  const run = refreshIndex(await loadRun(requiredString(input.run_id, "run_id")))
+  if (run.status !== "open") throw new InputError(`run ${run.id} is ${run.status}`)
+  const [workspace, repository] = await Promise.all([workspaceSnapshot(), repositoryControlSnapshot()])
+  const gate = gateRun(run, { workspace, repository })
+  run.gate = {
+    decision: gate.decision,
+    evaluated_at: new Date().toISOString(),
+    workspace: publicSnapshot(workspace),
+    repository: publicSnapshot(repository),
+  }
+  await saveRun(run)
+  return {
+    ...gate,
+    workspace_guard: publicSnapshot(workspace),
+    repository_guard: publicSnapshot(repository),
+  }
+}
+
+async function orchestratorClose(raw) {
+  const input = requireObject(raw, "arguments")
+  const run = refreshIndex(await loadRun(requiredString(input.run_id, "run_id")))
+  const outcome = enumValue(input.outcome, "outcome", new Set(["accepted", "abandoned"]))
+  if (outcome === "accepted") {
+    const [workspace, repository] = await Promise.all([workspaceSnapshot(), repositoryControlSnapshot()])
+    const gate = gateRun(run, { workspace, repository })
+    if (gate.decision !== "pass") throw new InputError("cannot accept a run that does not pass the gate", gate.reasons)
+    if (run.gate?.decision !== "pass") {
+      throw new InputError("call orchestrator_gate and obtain a passing decision immediately before accepting the run")
+    }
+    if (!workspace.available || !repository.available) {
+      throw new InputError("cannot verify repository state immediately before accepting the run")
+    }
+    if (run.gate.workspace?.digest !== workspace.digest || run.gate.repository?.digest !== repository.digest) {
+      throw new InputError(
+        "repository or Git control state changed after the passing gate; rerun independent evidence tasks and gate again",
+      )
+    }
+  }
+  run.status = outcome === "accepted" ? "closed" : "abandoned"
+  run.close = {
+    outcome,
+    note: optionalString(input.note, "note") || "",
+    closed_at: new Date().toISOString(),
+  }
+  await saveRun(run)
+  await ensureStateDirs()
+  await rename(runPath(run.id), runPath(run.id, true))
+  return { run_id: run.id, status: run.status, outcome, archived: true }
+}
+
+const handlers = Object.freeze({
+  orchestrator_plan: orchestratorPlan,
+  orchestrator_packet: orchestratorPacket,
+  orchestrator_record: orchestratorRecord,
+  orchestrator_status: orchestratorStatus,
+  orchestrator_gate: orchestratorGate,
+  orchestrator_close: orchestratorClose,
+})
+
+function textResult(value, isError = false) {
+  return {
+    content: [{ type: "text", text: JSON.stringify(value, null, 2) }],
+    structuredContent: value,
+    ...(isError ? { isError: true } : {}),
+  }
+}
+
+function send(message) {
+  process.stdout.write(`${JSON.stringify(message)}\n`)
+}
+
+function response(id, result) {
+  send({ jsonrpc: "2.0", id, result })
+}
+
+function errorResponse(id, code, message, data) {
+  send({ jsonrpc: "2.0", id, error: { code, message, ...(data === undefined ? {} : { data }) } })
+}
+

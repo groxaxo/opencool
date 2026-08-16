@@ -1,0 +1,314 @@
+#!/usr/bin/env node
+
+import crypto from "node:crypto"
+import { spawn, spawnSync } from "node:child_process"
+import { createReadStream } from "node:fs"
+import { chmod, lstat, mkdir, readFile, readlink, readdir, rename, rm, writeFile } from "node:fs/promises"
+import os from "node:os"
+import path from "node:path"
+
+const SERVER_NAME = "opencool-hierarchical-orchestrator"
+const SERVER_VERSION = "1.1.0"
+const PROTOCOL_VERSION = "2025-06-18"
+const SUPPORTED_PROTOCOL_VERSIONS = new Set([PROTOCOL_VERSION, "2025-03-26", "2024-11-05"])
+const STATE_VERSION = 2
+const RUN_ID = /^orch-\d{8}-[a-f0-9]{8}$/
+const TASK_ID = /^[a-z][a-z0-9_-]{0,47}$/
+const ROLES = new Set(["explorer", "worker", "tester", "critic", "synthesizer"])
+const COMPLEXITIES = new Set(["low", "medium", "high", "critical"])
+const STATUSES = new Set(["complete", "blocked", "failed"])
+const VERDICTS = new Set(["pass", "revise", "fail", "not_applicable"])
+const TEST_STATUSES = new Set(["pass", "fail", "skipped", "not_run"])
+const RISK_SEVERITIES = new Set(["low", "medium", "high", "critical"])
+const ROLE_AGENT = Object.freeze({
+  explorer: "qwen-explorer",
+  worker: "qwen-worker",
+  tester: "qwen-tester",
+  critic: "qwen-critic",
+  synthesizer: "qwen-synthesizer",
+})
+const MIN_CONFIDENCE = Object.freeze({ low: 0.6, medium: 0.7, high: 0.8, critical: 0.85 })
+
+const SERVER_INSTRUCTIONS = [
+  "This MCP enforces hierarchical coding orchestration.",
+  "For every non-trivial coding task, the primary model is the architect and judge; it must not perform the whole implementation itself.",
+  "Call hierarchy_orchestrator_plan before broad repository edits, execute each returned task packet through OpenCode's native task tool with the listed qwen-* subagent, record every result with hierarchy_orchestrator_record, run an independent qwen-critic, and call hierarchy_orchestrator_gate before declaring completion.",
+  "Use separate child contexts, bounded repository-relative scopes, local validation, and no GitHub Actions.",
+  "The primary architect is read-only: every repository mutation and command execution belongs to a bounded Qwen child session; the primary model owns decomposition, architecture, arbitration, and final acceptance.",
+].join(" ")
+
+function resolveWorkspaceRoot() {
+  const result = spawnSync("git", ["rev-parse", "--show-toplevel"], {
+    cwd: process.cwd(),
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "ignore"],
+  })
+  if (result.status === 0 && result.stdout.trim()) return path.resolve(result.stdout.trim())
+  return path.resolve(process.cwd())
+}
+
+const workspaceRoot = resolveWorkspaceRoot()
+const explicitStateDir = process.env.OPENCODE_ORCHESTRATOR_STATE_DIR
+const stateHome =
+  process.env.OPENCODE_ORCHESTRATOR_STATE_HOME ||
+  path.join(process.env.XDG_STATE_HOME || path.join(os.homedir(), ".local", "state"), "opencode", "hierarchy")
+const workspaceStateKey = crypto.createHash("sha256").update(workspaceRoot).digest("hex").slice(0, 16)
+const stateDir = explicitStateDir
+  ? path.resolve(workspaceRoot, explicitStateDir)
+  : path.resolve(stateHome, workspaceStateKey)
+const archiveDir = path.join(stateDir, "archive")
+
+class InputError extends Error {
+  constructor(message, details = []) {
+    super(message)
+    this.name = "InputError"
+    this.details = details
+  }
+}
+
+const stringArraySchema = {
+  type: "array",
+  items: { type: "string" },
+}
+
+const workstreamSchema = {
+  type: "object",
+  additionalProperties: false,
+  required: ["id", "role", "objective"],
+  properties: {
+    id: {
+      type: "string",
+      pattern: "^[a-z][a-z0-9_-]{0,47}$",
+      description: "Stable task identifier, for example inspect-loader or implement-registry.",
+    },
+    role: {
+      type: "string",
+      enum: ["explorer", "worker", "tester", "critic", "synthesizer"],
+    },
+    objective: { type: "string", minLength: 8 },
+    scope: {
+      ...stringArraySchema,
+      description: "Repository-relative files, directories, or globs. Required for mutating workers.",
+    },
+    deliverables: stringArraySchema,
+    validation: stringArraySchema,
+    depends_on: {
+      ...stringArraySchema,
+      description: "Task IDs that must complete first. The server also adds safe role dependencies.",
+    },
+    mutates: {
+      type: "boolean",
+      description: "Whether the task may edit files. Only worker tasks may mutate.",
+    },
+  },
+}
+
+const reportSchema = {
+  type: "object",
+  additionalProperties: false,
+  required: ["status", "summary", "confidence"],
+  properties: {
+    status: { type: "string", enum: ["complete", "blocked", "failed"] },
+    summary: { type: "string", minLength: 1 },
+    confidence: { type: "number", minimum: 0, maximum: 1 },
+    files_changed: stringArraySchema,
+    tests: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["command", "status"],
+        properties: {
+          command: { type: "string" },
+          status: { type: "string", enum: ["pass", "fail", "skipped", "not_run"] },
+          summary: { type: "string" },
+        },
+      },
+    },
+    risks: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["severity", "description"],
+        properties: {
+          severity: { type: "string", enum: ["low", "medium", "high", "critical"] },
+          description: { type: "string" },
+          resolved: { type: "boolean" },
+        },
+      },
+    },
+    blockers: stringArraySchema,
+    evidence: stringArraySchema,
+    acceptance_evidence: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["criterion", "evidence"],
+        properties: {
+          criterion: { type: "string" },
+          evidence: { type: "string" },
+        },
+      },
+    },
+    verdict: { type: "string", enum: ["pass", "revise", "fail", "not_applicable"] },
+  },
+}
+
+const tools = [
+  {
+    name: "orchestrator_plan",
+    description:
+      "Create and validate a hierarchical coding run. Returns dependency-ordered task packets for native OpenCode qwen-* subagents. Call this before substantive edits.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["objective", "complexity", "changes_code", "acceptance", "workstreams"],
+      properties: {
+        objective: { type: "string", minLength: 8 },
+        complexity: { type: "string", enum: ["low", "medium", "high", "critical"] },
+        changes_code: { type: "boolean" },
+        constraints: stringArraySchema,
+        acceptance: { ...stringArraySchema, minItems: 1 },
+        workstreams: { type: "array", minItems: 1, maxItems: 12, items: workstreamSchema },
+      },
+    },
+  },
+  {
+    name: "orchestrator_packet",
+    description:
+      "Hydrate or regenerate one task packet after its dependencies complete. Use feedback to retry the same child session rather than spawning an unbounded replacement.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["run_id", "task_id"],
+      properties: {
+        run_id: { type: "string" },
+        task_id: { type: "string" },
+        feedback: { type: "string" },
+        replace_active: {
+          type: "boolean",
+          description: "Replace an already-issued packet for this task. Normally false.",
+        },
+      },
+    },
+  },
+  {
+    name: "orchestrator_record",
+    description:
+      "Record a Qwen child-session result, validation evidence, changed files, risks, and critic verdict. This advances dependent workstreams.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["run_id", "task_id", "packet_id", "task_session_id", "report"],
+      properties: {
+        run_id: { type: "string" },
+        task_id: { type: "string" },
+        packet_id: { type: "string", description: "Opaque packet ID returned by orchestrator_plan or orchestrator_packet." },
+        task_session_id: { type: "string" },
+        report: reportSchema,
+      },
+    },
+  },
+  {
+    name: "orchestrator_status",
+    description:
+      "Show a run's task graph, latest worker evidence, blocked dependencies, and tasks ready for native OpenCode delegation. Omit run_id to list recent runs.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: { run_id: { type: "string" } },
+    },
+  },
+  {
+    name: "orchestrator_gate",
+    description:
+      "Apply the final evidence gate. Completion requires required workers, passing local tests for code changes, exact acceptance evidence, an independent critic pass, adequate confidence, and no unresolved severe risk.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["run_id"],
+      properties: { run_id: { type: "string" } },
+    },
+  },
+  {
+    name: "orchestrator_close",
+    description: "Close and archive a run as accepted or abandoned. Accepted runs must already pass the final gate.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["run_id", "outcome"],
+      properties: {
+        run_id: { type: "string" },
+        outcome: { type: "string", enum: ["accepted", "abandoned"] },
+        note: { type: "string" },
+      },
+    },
+  },
+]
+
+function isObject(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+}
+
+function requireObject(value, label) {
+  if (!isObject(value)) throw new InputError(`${label} must be an object`)
+  return value
+}
+
+function requiredString(value, label, minLength = 1) {
+  if (typeof value !== "string" || value.trim().length < minLength) {
+    throw new InputError(`${label} must be a string with at least ${minLength} non-whitespace characters`)
+  }
+  return value.trim()
+}
+
+function optionalString(value, label) {
+  if (value === undefined) return undefined
+  if (typeof value !== "string") throw new InputError(`${label} must be a string`)
+  return value.trim()
+}
+
+function requiredBoolean(value, label) {
+  if (typeof value !== "boolean") throw new InputError(`${label} must be a boolean`)
+  return value
+}
+
+function stringArray(value, label, options = {}) {
+  if (value === undefined && options.optional) return []
+  if (!Array.isArray(value)) throw new InputError(`${label} must be an array of strings`)
+  const next = value.map((item, index) => requiredString(item, `${label}[${index}]`))
+  if (options.min !== undefined && next.length < options.min) {
+    throw new InputError(`${label} must contain at least ${options.min} item(s)`)
+  }
+  return [...new Set(next)]
+}
+
+function enumValue(value, label, allowed) {
+  if (typeof value !== "string" || !allowed.has(value)) {
+    throw new InputError(`${label} must be one of: ${[...allowed].join(", ")}`)
+  }
+  return value
+}
+
+function optionalBoolean(value, label, fallback) {
+  if (value === undefined) return fallback
+  return requiredBoolean(value, label)
+}
+
+function confidence(value, label) {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || value > 1) {
+    throw new InputError(`${label} must be a finite number between 0 and 1`)
+  }
+  return value
+}
+
+function dateStamp() {
+  return new Date().toISOString().slice(0, 10).replaceAll("-", "")
+}
+
+function makeRunID() {
+  return `orch-${dateStamp()}-${crypto.randomBytes(4).toString("hex")}`
+}
+
